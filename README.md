@@ -1,6 +1,6 @@
 # Node Profiles
 
-A ComfyUI node that saves the settings of the nodes connected to it, like your prompts and selected images, as named profiles. Pick a profile and click Load to put everything back, so one workflow can switch between many prompt and image setups.
+A ComfyUI node for profile presets across your whole workflow. It saves the settings of the nodes connected to it, like your prompts and selected images, as named profiles. Pick a profile and click Load to put everything back, so one workflow can switch between many prompt and image setups.
 
 ## How it works
 
