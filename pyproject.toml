@@ -1,6 +1,6 @@
 [project]
 name = "brb-comfyui-node-profiles"
-version = "0.0.0"
+version = "1.0.0"
 description = "A ComfyUI node that saves the settings of connected nodes, like prompts and images, as profiles you can switch between."
 license = { file = "LICENSE" }
 

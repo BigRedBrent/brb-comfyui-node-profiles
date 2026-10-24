@@ -649,6 +649,9 @@ async function renameProfile(node) {
     }
     profiles[newName] = profiles[oldName];
     delete profiles[oldName];
+    if (node._loadedProfile === oldName) {
+        node._loadedProfile = newName;
+    }
     refreshProfileList(node, newName);
     markChanged();
     done(`Renamed "${oldName}" to "${newName}"`);
@@ -663,6 +666,9 @@ async function deleteProfile(node) {
         return;
     }
     delete profilesOf(node)[name];
+    if (node._loadedProfile === name) {
+        node._loadedProfile = null;
+    }
     refreshProfileList(node, profileNames(node)[0] ?? NO_PROFILE);
     markChanged();
     done(`Deleted "${name}"`);
@@ -781,6 +787,7 @@ async function importProfiles(node) {
         return;
     }
     node.properties.profiles = replacement;
+    node._loadedProfile = null;
     refreshProfileList(node, profileNames(node)[0] ?? NO_PROFILE);
     markChanged();
     done(`Imported ${newCount} profile(s) from ${file.name}`);
@@ -835,6 +842,161 @@ function updateSlots(node) {
 const GAP_HEIGHT = 10;
 const SMALL_GAP_HEIGHT = 2;
 
+// How often, in milliseconds, the node checks whether the connected nodes still match the selected profile.
+const CHECK_INTERVAL_MS = 500;
+
+// Save button color while the connected nodes differ from the selected profile.
+const CHANGED_COLOR = "#2e7d32";
+const CHANGED_TEXT_COLOR = "#ffffff";
+
+function comparable(saved) {
+    // A saved slot without the parts that don't describe the node itself.
+    if (!saved || typeof saved !== "object") {
+        return saved;
+    }
+    const { choices, ...rest } = saved;
+    return JSON.stringify(rest);
+}
+
+function saveWouldChange(node, name) {
+    // True when clicking Save with this profile selected would change what's saved in it. Null when Save
+    // wouldn't save anything, because nothing usable is connected.
+    const savedSlots = profilesOf(node)[name]?.slots || {};
+    const { slots } = captureProfile(node);
+    const currentNames = Object.keys(slots);
+    if (currentNames.length === 0) {
+        return null;
+    }
+    const savedNames = Object.keys(savedSlots);
+    if (savedNames.length !== currentNames.length || savedNames.some((slot) => !(slot in slots))) {
+        return true;
+    }
+    return currentNames.some((slot) => comparable(slots[slot]) !== comparable(savedSlots[slot]));
+}
+
+function differsFromProfile(node) {
+    // Watches only the profile that's currently selected. Once it matches what's connected exactly, Save
+    // turns green whenever something changes and saving would change it. Selecting a different profile
+    // starts over: the new one is only watched once it matches.
+    const name = selectedProfile(node);
+    if (name !== node._watchedSelection) {
+        node._watchedSelection = name;
+        node._loadedProfile = null;
+    }
+    if (!name) {
+        return false;
+    }
+    const wouldChange = saveWouldChange(node, name);
+    if (wouldChange === null) {
+        return false;
+    }
+    if (!wouldChange) {
+        node._loadedProfile = name;
+        return false;
+    }
+    return node._loadedProfile === name;
+}
+
+function addSaveButton(node) {
+    // ComfyUI's own Save button, with its colors swapped to green while the profile has changes to save.
+    // ComfyUI's buttons have no color setting, so the colors it reads while drawing the button are
+    // changed just for that moment, and the button keeps ComfyUI's own look and click behavior.
+    const button = node.addWidget("button", "Save", null, () => saveProfile(node));
+    button.changed = false;
+    const LiteGraph = window.LiteGraph || {};
+
+    for (const property of ["background_color", "text_color"]) {
+        const fallback = property === "background_color" ? "WIDGET_BGCOLOR" : "WIDGET_TEXT_COLOR";
+        const changedColor = property === "background_color" ? CHANGED_COLOR : CHANGED_TEXT_COLOR;
+        try {
+            const original = Object.getOwnPropertyDescriptor(button, property);
+            const prototypeGetter = (() => {
+                let proto = Object.getPrototypeOf(button);
+                while (proto) {
+                    const found = Object.getOwnPropertyDescriptor(proto, property);
+                    if (found?.get) {
+                        return found.get;
+                    }
+                    proto = Object.getPrototypeOf(proto);
+                }
+                return null;
+            })();
+            Object.defineProperty(button, property, {
+                configurable: true,
+                get() {
+                    if (this.changed) {
+                        return changedColor;
+                    }
+                    if (original && "value" in original) {
+                        return original.value;
+                    }
+                    return prototypeGetter ? prototypeGetter.call(this) : LiteGraph[fallback];
+                },
+                set(value) {
+                    Object.defineProperty(this, property, { configurable: true, writable: true, value });
+                },
+            });
+        } catch {
+            // Some versions don't allow this; the drawing swap below still applies.
+        }
+    }
+
+    for (const method of ["drawWidget", "draw"]) {
+        const original = button[method];
+        if (typeof original !== "function") {
+            continue;
+        }
+        button[method] = function (...args) {
+            if (!this.changed) {
+                return original.apply(this, args);
+            }
+            const saved = { bg: LiteGraph.WIDGET_BGCOLOR, text: LiteGraph.WIDGET_TEXT_COLOR };
+            LiteGraph.WIDGET_BGCOLOR = CHANGED_COLOR;
+            LiteGraph.WIDGET_TEXT_COLOR = CHANGED_TEXT_COLOR;
+            try {
+                return original.apply(this, args);
+            } finally {
+                LiteGraph.WIDGET_BGCOLOR = saved.bg;
+                LiteGraph.WIDGET_TEXT_COLOR = saved.text;
+            }
+        };
+    }
+    return button;
+}
+
+function startChecking(node) {
+    // Checks a couple of times a second, and redraws only when the result changes. Stops once the node
+    // is no longer in a workflow.
+    stopChecking(node);
+    node._profileCheck = setInterval(() => {
+        if (!node.graph || findNode(node.graph, node.id) !== node) {
+            stopChecking(node);
+            return;
+        }
+        const button = findWidget(node, "Save");
+        if (!button) {
+            return;
+        }
+        let changed = false;
+        try {
+            changed = differsFromProfile(node);
+        } catch (error) {
+            changed = false;
+        }
+        if (changed !== button.changed) {
+            button.changed = changed;
+            node.setDirtyCanvas?.(true, true);
+        }
+    }, CHECK_INTERVAL_MS);
+}
+
+function stopChecking(node) {
+    if (node._profileCheck) {
+        clearInterval(node._profileCheck);
+        node._profileCheck = null;
+    }
+}
+
 function addGap(node, name, height = GAP_HEIGHT) {
     // An empty widget that only takes up space.
     const gap = {
@@ -880,7 +1042,7 @@ app.registerExtension({
                 addGap(this, "gap_profile", SMALL_GAP_HEIGHT);
                 this.addWidget("button", "Load", null, () => loadProfile(this));
                 addGap(this, "gap_load", SMALL_GAP_HEIGHT);
-                this.addWidget("button", "Save", null, () => saveProfile(this));
+                addSaveButton(this);
                 addGap(this, "gap_save");
                 this.addWidget("button", "Save As", null, () => saveProfileAs(this));
                 addGap(this, "gap_save_as", SMALL_GAP_HEIGHT);
@@ -928,6 +1090,14 @@ app.registerExtension({
                     restore[toggle.key] = !!findWidget(this, toggle.name)?.value;
                 }
                 data.properties.restore = restore;
+            }
+
+            onAdded() {
+                startChecking(this);
+            }
+
+            onRemoved() {
+                stopChecking(this);
             }
 
             onConfigure() {

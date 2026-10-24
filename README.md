@@ -16,7 +16,7 @@ Profiles are kept inside the node, so they're saved with the workflow. Save the 
 
 - **profile:** the list of saved profiles.
 - **Load:** restores the selected profile. If a slot has saved settings but nothing connected, or a saved value no longer exists, the rest is still restored and a message lists what was skipped. Each saved setting goes back to the setting with the same name. Saved text that has no matching name, such as when a node was swapped for a different kind, goes into the remaining text fields in order, first to first. A message only appears for saved settings that had nowhere to go.
-- **Save:** saves the current settings over the selected profile, after asking.
+- **Save:** saves the current settings over the selected profile, after asking. It turns green when the loaded profile has changes that could be saved.
 - **Save As:** saves the current settings under a new name. Using an existing name asks before overwriting.
 - **Rename:** renames the selected profile. A name that's already in use is refused.
 - **Delete:** deletes the selected profile, after asking.
