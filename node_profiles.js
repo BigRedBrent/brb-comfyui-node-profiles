@@ -635,7 +635,8 @@ async function loadProfile(node) {
     if (problems.length > 0) {
         await warn(`Loaded "${name}", with these problems:\n\n${problems.join("\n")}`);
     } else {
-        done(`Loaded "${name}"`);
+        // No notice: profiles load every time one is picked, so notices would pile up while flipping through.
+        console.log(`${LOG_PREFIX} Loaded "${name}"`);
     }
 }
 
@@ -644,10 +645,6 @@ async function saveProfile(node) {
     if (!name) {
         // No profile to save over yet, so ask for a name, the same as Save As.
         await saveProfileAs(node);
-        return;
-    }
-    if (!node._hasChanges) {
-        // Nothing would change, so there's nothing to save.
         return;
     }
     if (await confirmDialog(`Overwrite profile "${name}"?`, "overwrite")) {
