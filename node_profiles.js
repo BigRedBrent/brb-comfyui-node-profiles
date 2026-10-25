@@ -656,7 +656,8 @@ async function saveProfile(node) {
 }
 
 async function saveProfileAs(node) {
-    const name = await nameDialog("Name for the new profile:", "");
+    // Starts with the selected profile's name, so it's easy to save a variation under a similar name.
+    const name = await nameDialog("Name for the new profile:", selectedProfile(node) ?? "");
     if (!name) {
         return;
     }
