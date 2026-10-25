@@ -1,7 +1,7 @@
 [project]
 name = "brb-comfyui-node-profiles"
-version = "1.0.1"
-description = "A ComfyUI node for profile presets that saves the settings of connected nodes, like prompts and images, and switches between them."
+version = "1.1.0"
+description = "A ComfyUI node for profile presets that saves the settings of connected nodes, like prompts, images and other widget values, and easily switches between them."
 license = { file = "LICENSE" }
 
 [project.urls]
