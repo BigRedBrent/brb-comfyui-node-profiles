@@ -493,6 +493,17 @@ function profilesOf(node) {
     return node.properties.profiles;
 }
 
+function hasProfile(profiles, name) {
+    // Only profiles actually saved count, not the names every JavaScript object has built in, like
+    // "toString" or "constructor".
+    return typeof name === "string" && Object.hasOwn(profiles, name);
+}
+
+function setProfile(profiles, name, profile) {
+    // Stores the profile as a plain entry, so any name works, including special ones like "__proto__".
+    Object.defineProperty(profiles, name, { value: profile, enumerable: true, writable: true, configurable: true });
+}
+
 function profileNames(node) {
     return Object.keys(profilesOf(node)).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 }
@@ -526,7 +537,7 @@ async function profilePicked(node, value) {
     if (value === previous) {
         return;
     }
-    if (previous && previous in profilesOf(node) && saveWouldChange(node, previous) === true) {
+    if (previous && hasProfile(profilesOf(node), previous) && saveWouldChange(node, previous) === true) {
         // The profile being left has changes that haven't been saved (Save is green), so ask first.
         const message = `Profile "${previous}" has changes that haven't been saved. Switch to "${value}" anyway?`;
         if (!(await confirmDialog(message, "default"))) {
@@ -539,14 +550,14 @@ async function profilePicked(node, value) {
         }
     }
     node._pickedProfile = value;
-    if (value && value !== NO_PROFILE && value in profilesOf(node)) {
+    if (value && value !== NO_PROFILE && hasProfile(profilesOf(node), value)) {
         await loadProfile(node);
     }
 }
 
 function selectedProfile(node) {
     const value = findWidget(node, "profile")?.value;
-    if (!value || value === NO_PROFILE || !(value in profilesOf(node))) {
+    if (!value || value === NO_PROFILE || !hasProfile(profilesOf(node), value)) {
         return null;
     }
     return value;
@@ -579,7 +590,7 @@ async function saveInto(node, name) {
         await warn("Nothing is connected to the slots, so there's nothing to save.");
         return false;
     }
-    profilesOf(node)[name] = { slots };
+    setProfile(profilesOf(node), name, { slots });
     refreshProfileList(node, name);
     markChanged();
     if (problems.length > 0) {
@@ -653,7 +664,7 @@ async function saveProfileAs(node) {
         await warn(`"${NO_PROFILE}" can't be used as a profile name.`);
         return;
     }
-    if (name in profilesOf(node) && !(await confirmDialog(`Overwrite profile "${name}"?`, "overwrite"))) {
+    if (hasProfile(profilesOf(node), name) && !(await confirmDialog(`Overwrite profile "${name}"?`, "overwrite"))) {
         return;
     }
     await saveInto(node, name);
@@ -673,11 +684,11 @@ async function renameProfile(node) {
         return;
     }
     const profiles = profilesOf(node);
-    if (newName in profiles) {
+    if (hasProfile(profiles, newName)) {
         await warn(`A profile named "${newName}" already exists. Delete it first to use that name.`);
         return;
     }
-    profiles[newName] = profiles[oldName];
+    setProfile(profiles, newName, profiles[oldName]);
     delete profiles[oldName];
     refreshProfileList(node, newName);
     markChanged();
@@ -800,7 +811,7 @@ async function importProfiles(node) {
     const replacement = {};
     for (const [name, profile] of Object.entries(imported)) {
         if (name && name !== NO_PROFILE && profile && typeof profile === "object") {
-            replacement[name] = copyOf(profile);
+            setProfile(replacement, name, copyOf(profile));
         }
     }
     const newCount = Object.keys(replacement).length;
