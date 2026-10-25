@@ -884,13 +884,35 @@ const CHECK_INTERVAL_MS = 500;
 const CHANGED_COLOR = "#2e7d32";
 const CHANGED_TEXT_COLOR = "#ffffff";
 
-function comparable(saved) {
-    // A saved slot without the parts that don't describe the node itself.
+function comparable(saved, restore) {
+    // A saved slot without the parts that don't describe the node itself, and without the title, color, size
+    // and collapsed state while their restore toggles are off, since Discard wouldn't put those back.
     if (!saved || typeof saved !== "object") {
         return saved;
     }
     const { choices, ...rest } = saved;
+    if (!restore.title) {
+        delete rest.title;
+    }
+    if (!restore.color) {
+        delete rest.color;
+        delete rest.bgcolor;
+    }
+    if (!restore.size) {
+        delete rest.size;
+    }
+    if (!restore.collapsed) {
+        delete rest.collapsed;
+    }
     return JSON.stringify(rest);
+}
+
+function restoreToggles(node) {
+    const restore = {};
+    for (const toggle of TOGGLES) {
+        restore[toggle.key] = !!findWidget(node, toggle.name)?.value;
+    }
+    return restore;
 }
 
 function saveWouldChange(node, name) {
@@ -906,7 +928,8 @@ function saveWouldChange(node, name) {
     if (savedNames.length !== currentNames.length || savedNames.some((slot) => !(slot in slots))) {
         return true;
     }
-    return currentNames.some((slot) => comparable(slots[slot]) !== comparable(savedSlots[slot]));
+    const restore = restoreToggles(node);
+    return currentNames.some((slot) => comparable(slots[slot], restore) !== comparable(savedSlots[slot], restore));
 }
 
 function differsFromProfile(node) {
