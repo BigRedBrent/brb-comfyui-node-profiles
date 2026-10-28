@@ -16,6 +16,27 @@ const NODE_TYPE = "Node Profiles";
 const NODE_TITLE = "Node Profiles";
 const LOG_PREFIX = "[Node Profiles]";
 
+// Writes each step of loading a profile to the browser console, to help find problems with nodes that change
+// their own settings. Only setting names and timings are written, never their values, which can be private.
+const DEBUG = false;
+
+// After loading a profile, the settings are checked for a moment, in case the node changes them by itself, or
+// loads a dropdown's choices, a moment after a setting changes. All times are in milliseconds.
+// How often to check.
+const SETTLE_STEP_MS = 250;
+// Once everything matches, how long to keep watching for late changes before stopping.
+const WATCH_AFTER_MATCH_MS = 1000;
+// The longest to keep checking when things still don't match. A pop-up then lists what didn't.
+const SETTLE_TIME_MS = 3000;
+// How many checks in a row everything has to match before the node is told about every setting once more.
+const SETTLED_CHECKS = 1;
+
+// If a dropdown's value still isn't among its choices after this long, every setting is set again.
+const SETTLE_RETRY_MS = 500;
+
+// The most times the node is told about every setting again, while checking.
+const MAX_TELL_AGAIN = 3;
+
 // The node always has at least this many slots. One more is added whenever the last one is connected.
 const MIN_SLOTS = 2;
 const SLOT_PREFIX = "slot_";
@@ -267,14 +288,51 @@ function choicesOf(widget, node) {
     return Array.isArray(values) ? values : null;
 }
 
-function setValue(node, widget, value, problems, label) {
-    if (widget.type === "combo") {
-        const choices = choicesOf(widget, node);
-        if (choices && !choices.includes(value)) {
-            problems.push(`${label}: "${value}" is no longer available for "${widget.name}"`);
-            return;
-        }
+function debug(...args) {
+    if (DEBUG) {
+        console.log(LOG_PREFIX, ...args);
     }
+}
+
+function sameValue(a, b) {
+    if (a === b) {
+        return true;
+    }
+    try {
+        return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+        return false;
+    }
+}
+
+function available(node, widget, value) {
+    // Whether a dropdown has this value among its choices. Anything that isn't a dropdown always can take it.
+    if (widget.type !== "combo") {
+        return true;
+    }
+    const choices = choicesOf(widget, node);
+    return !choices || choices.includes(value);
+}
+
+function setValue(node, widget, value, restored, label) {
+    // Puts a value back and remembers it in "restored", so it can be checked once the node has had time to react.
+    const item = { node, widget, value, label, previous: copyOf(widget.value), waiting: false };
+    restored.push(item);
+    if (!available(node, widget, value)) {
+        // The dropdown doesn't have this choice yet. Some nodes fill in a dropdown's choices a moment after
+        // another setting changes, such as a folder setting that lists the images in that folder. The value is
+        // put in place now, so the node sees it when its new choices arrive and keeps it, and the node is told
+        // about it once it's among the choices.
+        item.waiting = true;
+        widget.value = copyOf(value);
+        debug(`${label}: "${widget.name}" restored (not among its choices yet, waiting)`);
+        return;
+    }
+    setAndTell(node, widget, value, label);
+    debug(`${label}: "${widget.name}" restored`);
+}
+
+function setAndTell(node, widget, value, label) {
     widget.value = copyOf(value);
     try {
         // Lets the node react as if the value was picked by hand, such as Load Image showing the new image.
@@ -303,7 +361,7 @@ function savedEntries(saved) {
     }));
 }
 
-function restoreSlot(found, saved, restore, problems, label) {
+function restoreSlot(found, saved, restore, problems, restored, label) {
     // Puts a slot's saved values back into what the slot leads to now: a whole node, or a single field.
     // Values go to the setting with the same name. Saved text with no matching name goes into the remaining
     // text fields in order, first to first, so text still lands somewhere if the node was swapped for a
@@ -312,7 +370,7 @@ function restoreSlot(found, saved, restore, problems, label) {
     const targets = found.field ? [found.field.widget] : (targetNode.widgets || []).filter(isSetting);
     const put = (widget, value) => {
         const holder = found.field ? found.field : holderOf({ node: targetNode, widget });
-        setValue(holder.node, holder.widget, value, problems, label);
+        setValue(holder.node, holder.widget, value, restored, label);
     };
 
     const used = new Set();
@@ -365,6 +423,105 @@ function restoreSlot(found, saved, restore, problems, label) {
     if (restore.collapsed && typeof saved.collapsed === "boolean" && !!node.flags?.collapsed !== saved.collapsed) {
         node.collapse?.(true);
     }
+}
+
+async function settle(node, token, restored, problems, interrupted) {
+    // Keeps checking the restored settings for a moment, since some nodes change their own settings, or load a
+    // dropdown's choices, after a setting changes. A setting that no longer matches is set again once its value
+    // can be used. If a dropdown's value still isn't among its choices after a while, every setting is set again,
+    // so the node reloads its choices for the restored settings. Once everything matches, and anything had to be
+    // set again, the node is told about every setting once more, in order, so whatever it shows (like an image
+    // preview) ends up matching. After everything matches, it keeps watching for a second in case the node
+    // changes something late, such as when a dropdown's choices from an earlier setting arrive after the newer
+    // ones, then stops. Returns false if another profile was picked in the meantime, which takes over.
+    // "interrupted" means this load took over from one still in progress. That one may have left the node
+    // still reacting, like an image preview still loading, so the node is told about every setting once
+    // more after everything matches, the same as when something had to be set again.
+    const started = Date.now();
+    let settledChecks = 0;
+    let matchedSince = null;
+    let fixed = !!interrupted;
+    let retried = false;
+    let toldAgain = 0;
+    const tellAll = (why) => {
+        debug(`${why} (after ${Date.now() - started} ms)`);
+        for (const item of restored) {
+            item.waiting = !available(item.node, item.widget, item.value);
+            if (item.waiting) {
+                item.widget.value = copyOf(item.value);
+            } else {
+                setAndTell(item.node, item.widget, item.value, item.label);
+            }
+        }
+    };
+    while (true) {
+        await new Promise((resolve) => setTimeout(resolve, SETTLE_STEP_MS));
+        if (node._loadToken !== token) {
+            debug(`Stopped checking: another profile was picked`);
+            return false;
+        }
+        let allMatch = true;
+        let stillWaiting = false;
+        for (const item of restored) {
+            if (!item.waiting && sameValue(item.widget.value, item.value)) {
+                continue;
+            }
+            allMatch = false;
+            if (!available(item.node, item.widget, item.value)) {
+                stillWaiting = true;
+                continue;
+            }
+            if (!item.waiting) {
+                debug(`${item.label}: the node changed "${item.widget.name}", setting it back`);
+            }
+            item.waiting = false;
+            fixed = true;
+            setAndTell(item.node, item.widget, item.value, item.label);
+            debug(`${item.label}: "${item.widget.name}" restored (after ${Date.now() - started} ms)`);
+        }
+        if (stillWaiting && !retried && Date.now() - started >= SETTLE_RETRY_MS) {
+            retried = true;
+            fixed = true;
+            settledChecks = 0;
+            matchedSince = null;
+            tellAll("A dropdown's value still isn't among its choices, so every setting is set again");
+            continue;
+        }
+        settledChecks = allMatch ? settledChecks + 1 : 0;
+        if (settledChecks >= SETTLED_CHECKS && fixed && toldAgain < MAX_TELL_AGAIN) {
+            toldAgain += 1;
+            fixed = false;
+            settledChecks = 0;
+            tellAll("Settings had to be set again, so the node is told about all of them once more");
+            // The second of watching counts from here, as long as everything still matches at the next check.
+            matchedSince = Date.now();
+            continue;
+        }
+        if (!allMatch) {
+            matchedSince = null;
+        } else if (matchedSince === null) {
+            matchedSince = Date.now();
+        } else if (Date.now() - matchedSince >= WATCH_AFTER_MATCH_MS) {
+            debug(`All settings matched, stopped checking after ${Date.now() - started} ms`);
+            return true;
+        }
+        if (Date.now() - started >= SETTLE_TIME_MS) {
+            break;
+        }
+    }
+    for (const item of restored) {
+        if (item.waiting || !available(item.node, item.widget, item.value)) {
+            if (item.waiting && sameValue(item.widget.value, item.value)) {
+                // Never became one of the choices, so the dropdown goes back to what it showed before.
+                item.widget.value = item.previous;
+            }
+            problems.push(`${item.label}: "${item.value}" is no longer available for "${item.widget.name}"`);
+        } else if (!sameValue(item.widget.value, item.value)) {
+            problems.push(`${item.label}: the node keeps changing "${item.widget.name}" to "${item.widget.value}"`);
+        }
+    }
+    debug(`Stopped checking after ${Date.now() - started} ms`);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -454,7 +611,7 @@ async function nameDialog(message, startingName) {
 }
 
 function warn(message) {
-    console.warn(`${LOG_PREFIX} ${message}`);
+    // Only shown in the pop-up, not written to the browser console, since it can include settings' values.
     return messageDialog(message);
 }
 
@@ -537,7 +694,8 @@ async function profilePicked(node, value) {
     if (value === previous) {
         return;
     }
-    if (previous && hasProfile(profilesOf(node), previous) && saveWouldChange(node, previous) === true) {
+    // While a profile is still being loaded, its settings may not all match yet, so that's not asked about.
+    if (!node._loading && previous && hasProfile(profilesOf(node), previous) && saveWouldChange(node, previous) === true) {
         // The profile being left has changes that haven't been saved (Save is green), so ask first.
         const message = `Profile "${previous}" has changes that haven't been saved. Switch to "${value}" anyway?`;
         if (!(await confirmDialog(message, "default"))) {
@@ -611,7 +769,17 @@ async function loadProfile(node) {
         restore[toggle.key] = !!findWidget(node, toggle.name)?.value;
     }
 
+    // Picking another profile while this one is still loading takes over, and this one stops.
+    const token = (node._loadToken || 0) + 1;
+    const interrupted = !!node._loading;
+    node._loadToken = token;
+    node._loading = true;
+    setHasChanges(node, false);
+    startProgress(node);
+    debug(`Loading "${name}"`);
+
     const problems = [];
+    const restored = [];
     for (const [slotName, saved] of Object.entries(profilesOf(node)[name].slots || {})) {
         const input = (node.inputs || []).find((item) => item.name === slotName);
         if (!input) {
@@ -628,9 +796,22 @@ async function loadProfile(node) {
             continue;
         }
         const title = (found.field ? found.field.node : found.node).title;
-        restoreSlot(found, saved, restore, problems, `${slotLabel(input)} (${title})`);
+        restoreSlot(found, saved, restore, problems, restored, `${slotLabel(input)} (${title})`);
     }
 
+    let finished = false;
+    try {
+        finished = await settle(node, token, restored, problems, interrupted);
+    } finally {
+        if (node._loadToken === token) {
+            node._loading = false;
+            finishProgress(node);
+        }
+    }
+    if (!finished) {
+        return;
+    }
+    checkForChanges(node);
     markChanged();
     if (problems.length > 0) {
         await warn(`Loaded "${name}", with these problems:\n\n${problems.join("\n")}`);
@@ -714,8 +895,11 @@ async function deleteProfile(node) {
 const EXPORT_FORMAT = "node-profiles";
 const EXPORT_VERSION = 1;
 
-// The file name suggested when exporting. It can be changed in the save window.
-const EXPORT_FILE_NAME = "node_profiles.json";
+// The file name suggested when exporting. It can be changed in the save window. The file holds JSON, but has its
+// own extension, so it isn't mistaken for a workflow (ComfyUI tries to open any .json file dropped on it as one),
+// and browsers don't warn about it, as Chrome does for .cfg.
+const EXPORT_EXTENSION = ".nodeprofiles";
+const EXPORT_FILE_NAME = `profiles${EXPORT_EXTENSION}`;
 
 async function exportProfiles(node) {
     const profiles = profilesOf(node);
@@ -732,7 +916,7 @@ async function exportProfiles(node) {
         try {
             handle = await window.showSaveFilePicker({
                 suggestedName: EXPORT_FILE_NAME,
-                types: [{ description: "Node Profiles", accept: { "application/json": [".json"] } }],
+                types: [{ description: "Node Profiles", accept: { "text/plain": [EXPORT_EXTENSION] } }],
             });
         } catch (error) {
             if (error?.name !== "AbortError") {
@@ -753,7 +937,7 @@ async function exportProfiles(node) {
     }
 
     // Browsers without a save window: a normal download.
-    const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
     const link = document.createElement("a");
     link.href = url;
     link.download = EXPORT_FILE_NAME;
@@ -765,11 +949,11 @@ async function exportProfiles(node) {
 }
 
 function chooseFile() {
-    // Opens a window to pick a .json file. Resolves to { name, text }, or null if nothing was picked.
+    // Opens a window to pick an exported file. Resolves to { name, text }, or null if nothing was picked.
     return new Promise((resolve) => {
         const picker = document.createElement("input");
         picker.type = "file";
-        picker.accept = ".json,application/json";
+        picker.accept = EXPORT_EXTENSION;
         picker.style.display = "none";
         picker.addEventListener("change", () => {
             const file = picker.files?.[0];
@@ -1032,21 +1216,127 @@ function startChecking(node) {
             stopChecking(node);
             return;
         }
-        let changed = false;
-        try {
-            changed = differsFromProfile(node);
-        } catch (error) {
-            changed = false;
-        }
-        if (changed !== !!node._hasChanges) {
-            node._hasChanges = changed;
-            const discard = findWidget(node, "Discard");
-            if (discard) {
-                discard.disabled = !changed;
-            }
-            node.setDirtyCanvas?.(true, true);
-        }
+        checkForChanges(node);
     }, CHECK_INTERVAL_MS);
+}
+
+// Color of the bar that fills the profile list while a profile is loading.
+const PROGRESS_COLOR = "#1976d2";
+
+// When loading finishes, how long the bar takes to sweep the rest of the way across, in milliseconds.
+const PROGRESS_SWEEP_MS = 200;
+
+function startProgress(node) {
+    // Starts the bar over from the left, also when another profile is picked while one is still loading.
+    node._progress = { started: Date.now(), finishedAt: null, from: 0 };
+    animateProgress(node);
+}
+
+function finishProgress(node) {
+    const progress = node._progress;
+    if (!progress || progress.finishedAt !== null) {
+        return;
+    }
+    progress.from = progressOf(node) ?? 0;
+    progress.finishedAt = Date.now();
+}
+
+function progressOf(node) {
+    // How much of the list is filled, from 0 to 1, or null when nothing is loading. While loading, it fills
+    // toward the longest a load can take. Once done, it sweeps the rest of the way across.
+    const progress = node._progress;
+    if (!progress) {
+        return null;
+    }
+    const now = Date.now();
+    if (progress.finishedAt === null) {
+        return Math.min(1, (now - progress.started) / SETTLE_TIME_MS);
+    }
+    const sweep = Math.min(1, (now - progress.finishedAt) / PROGRESS_SWEEP_MS);
+    return progress.from + (1 - progress.from) * sweep;
+}
+
+function animateProgress(node) {
+    // Redraws the node every frame while the bar is showing, then once more after it's gone.
+    if (node._progressAnimating) {
+        return;
+    }
+    node._progressAnimating = true;
+    const step = () => {
+        const progress = node._progress;
+        if (progress && progress.finishedAt !== null && Date.now() - progress.finishedAt >= PROGRESS_SWEEP_MS) {
+            node._progress = null;
+        }
+        node.setDirtyCanvas?.(true, false);
+        if (!node._progress) {
+            node._progressAnimating = false;
+            return;
+        }
+        requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+}
+
+function addProgressFill(list, node) {
+    // Draws the bar inside the profile list, over its background and under its text. ComfyUI draws a list's
+    // background and outline first, then its text, so the bar is drawn right after the background, and the
+    // outline is drawn again on top of it.
+    const drawShape = list?.drawWidgetShape;
+    if (typeof drawShape !== "function") {
+        return;
+    }
+    list.drawWidgetShape = function (ctx, options) {
+        drawShape.call(this, ctx, options);
+        const fraction = progressOf(node);
+        if (fraction === null || !options?.showText) {
+            return;
+        }
+        const margin = this.constructor?.margin ?? 15;
+        const width = options.width - margin * 2;
+        const { height, y } = this;
+        const outline = () => {
+            ctx.beginPath();
+            ctx.roundRect(margin, y, width, height, [height * 0.5]);
+        };
+        ctx.save();
+        outline();
+        ctx.clip();
+        ctx.fillStyle = PROGRESS_COLOR;
+        ctx.fillRect(margin, y, width * fraction, height);
+        ctx.restore();
+        if (!this.computedDisabled) {
+            outline();
+            ctx.stroke();
+        }
+    };
+}
+
+function checkForChanges(node) {
+    // Turns Save green, and Discard on, when the settings differ from the selected profile.
+    if (node._loading) {
+        // Settings may not all match until the profile has finished loading.
+        return;
+    }
+    let changed = false;
+    try {
+        changed = differsFromProfile(node);
+    } catch (error) {
+        changed = false;
+    }
+    setHasChanges(node, changed);
+}
+
+function setHasChanges(node, changed) {
+    // Redraws only when the result changes.
+    if (changed === !!node._hasChanges) {
+        return;
+    }
+    node._hasChanges = changed;
+    const discard = findWidget(node, "Discard");
+    if (discard) {
+        discard.disabled = !changed;
+    }
+    node.setDirtyCanvas?.(true, true);
 }
 
 function stopChecking(node) {
@@ -1098,9 +1388,10 @@ app.registerExtension({
 
                 addGap(this, "gap_top", SMALL_GAP_HEIGHT);
                 // Picking a different profile in the list loads it.
-                this.addWidget("combo", "profile", NO_PROFILE, (value) => profilePicked(this, value), {
+                const list = this.addWidget("combo", "profile", NO_PROFILE, (value) => profilePicked(this, value), {
                     values: [NO_PROFILE],
                 });
+                addProgressFill(list, this);
                 addGap(this, "gap_profile", SMALL_GAP_HEIGHT);
                 addSaveButton(this);
                 addGap(this, "gap_save", SMALL_GAP_HEIGHT);

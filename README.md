@@ -21,5 +21,5 @@ Profiles are kept inside the node, so they're saved with the workflow. Save the 
 - **Rename:** renames the selected profile. A name that's already in use is refused.
 - **Delete:** deletes the selected profile, after asking.
 - **restore title, restore color, restore size, restore collapsed:** these are always saved, but only put back when turned on. All are off by default.
-- **Import:** replaces all the node's profiles with the ones from a .json file, after asking.
-- **Export:** saves all the node's profiles to a .json file.
+- **Import:** replaces all the node's profiles with the ones from an exported .nodeprofiles file, after asking.
+- **Export:** saves all the node's profiles to a .nodeprofiles file. It's ordinary text, but doesn't end in .json, so it isn't mistaken for a workflow.
