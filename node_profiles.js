@@ -58,6 +58,12 @@ const MAX_STEPS = 100;
 // How much wider than the smallest size a new node starts, to leave room for longer profile names.
 const START_WIDTH_FACTOR = 1.75;
 
+// A toggle, on by default, that skips checking the settings after loading, so loading is done at once. Turning it
+// off is for nodes that change their own settings, or load their choices late, after a profile is loaded.
+const FAST_LOAD = "fast load";
+const FAST_LOAD_TOOLTIP =
+    "Loads at once, without checking that every setting stuck. Turn off if a node doesn't fully load correctly.";
+
 const TOGGLES = [
     { name: "restore title", key: "title" },
     { name: "restore color", key: "color" },
@@ -772,11 +778,17 @@ async function loadProfile(node) {
     // Picking another profile while this one is still loading takes over, and this one stops.
     const token = (node._loadToken || 0) + 1;
     const interrupted = !!node._loading;
+    const fast = !!findWidget(node, FAST_LOAD)?.value;
     node._loadToken = token;
     node._loading = true;
     setHasChanges(node, false);
-    startProgress(node);
-    debug(`Loading "${name}"`);
+    if (fast) {
+        // No checking, so no bar. A bar left from a load still going when this one started sweeps away.
+        finishProgress(node);
+    } else {
+        startProgress(node);
+    }
+    debug(`Loading "${name}"${fast ? " (fast load)" : ""}`);
 
     const problems = [];
     const restored = [];
@@ -801,7 +813,20 @@ async function loadProfile(node) {
 
     let finished = false;
     try {
-        finished = await settle(node, token, restored, problems, interrupted);
+        if (fast) {
+            // Done at once: a dropdown value that isn't among its choices right now isn't waited for.
+            for (const item of restored) {
+                if (item.waiting) {
+                    if (sameValue(item.widget.value, item.value)) {
+                        item.widget.value = item.previous;
+                    }
+                    problems.push(`${item.label}: "${item.value}" is no longer available for "${item.widget.name}"`);
+                }
+            }
+            finished = true;
+        } else {
+            finished = await settle(node, token, restored, problems, interrupted);
+        }
     } finally {
         if (node._loadToken === token) {
             node._loading = false;
@@ -1403,6 +1428,13 @@ app.registerExtension({
                 addGap(this, "gap_rename");
                 this.addWidget("button", "Delete", null, () => deleteProfile(this));
                 addGap(this, "gap_3");
+                const fastLoad = this.addWidget("toggle", FAST_LOAD, true, () => {}, {
+                    on: "on",
+                    off: "off",
+                    tooltip: FAST_LOAD_TOOLTIP,
+                });
+                fastLoad.tooltip = FAST_LOAD_TOOLTIP;
+                addGap(this, "gap_fast_load", SMALL_GAP_HEIGHT);
                 TOGGLES.forEach((toggle, index) => {
                     if (index > 0) {
                         addGap(this, `gap_${toggle.key}`, SMALL_GAP_HEIGHT);
@@ -1443,6 +1475,7 @@ app.registerExtension({
                     restore[toggle.key] = !!findWidget(this, toggle.name)?.value;
                 }
                 data.properties.restore = restore;
+                data.properties.fast_load = !!findWidget(this, FAST_LOAD)?.value;
             }
 
             onAdded() {
@@ -1460,6 +1493,12 @@ app.registerExtension({
                     if (widget && typeof saved.restore?.[toggle.key] === "boolean") {
                         widget.value = saved.restore[toggle.key];
                     }
+                }
+                // Workflows saved before this toggle existed don't have it, so it's on for those, its default. That
+                // also undoes a value ComfyUI may have put in it from the old order of the node's widgets.
+                const fastLoad = findWidget(this, FAST_LOAD);
+                if (fastLoad) {
+                    fastLoad.value = saved.fast_load !== false;
                 }
                 setTimeout(() => {
                     updateSlots(this);
