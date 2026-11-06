@@ -215,7 +215,9 @@ function valueSettingOf(node, slot) {
 function holderOf(target) {
     // Where a field's value is really kept. A setting of a node inside a subgraph can be connected to one of
     // the subgraph's inputs and shown as a field on the subgraph's outside; then the value is kept in that
-    // outside field, possibly through several subgraphs. Returns { node, widget }.
+    // outside field, possibly through several subgraphs. Returns { node, widget }. When the setting is wired from a
+    // node whose value can't be traced to one setting, like text joined from several pieces, it also has
+    // stuck: true and stuckAt: that node, since the setting's own value isn't the one that's used.
     for (let step = 0; step < MAX_STEPS; step++) {
         const { node, widget } = target;
         const input = (node.inputs || []).find((item) => item.widget?.name === widget.name && item.link != null);
@@ -228,14 +230,14 @@ function holderOf(target) {
         }
         if (!startsAtSubgraphInput(link)) {
             // Wired from another node: follow it to the setting there that the value comes from. If that can't
-            // be told, the setting's own value is used.
+            // be told, there's nowhere useful to save it from or restore it to.
             const found = sourceOf(node.graph, input.link);
             if (found.field) {
                 return found.field;
             }
             const next = found.node ? valueSettingOf(found.node, found.slot) : null;
             if (!next) {
-                return target;
+                return { ...target, stuck: true, stuckAt: found.node || null };
             }
             target = { node: found.node, widget: next };
             continue;
@@ -275,7 +277,15 @@ function isSetting(widget) {
     return !!widget?.name && widget.type !== "button" && widget.serialize !== false;
 }
 
-function captureNode(node) {
+function stuckText(holder) {
+    // Why a setting can't be saved or restored, for a warning.
+    const from = holder.stuckAt?.title ? `"${holder.stuckAt.title}"` : "another node";
+    return `"${holder.widget.name}" is wired from ${from}, which works out its value from more than one thing`;
+}
+
+function captureNode(node, skipped = null) {
+    // Settings that can't be traced to where their value is kept (see holderOf) are left out, and their reasons
+    // added to skipped.
     const settings = {};
     const choices = [];
     for (const widget of node.widgets || []) {
@@ -283,6 +293,10 @@ function captureNode(node) {
             continue;
         }
         const holder = holderOf({ node, widget });
+        if (holder.stuck) {
+            skipped?.push({ name: widget.name, text: stuckText(holder) });
+            continue;
+        }
         const value = copyOf(holder.widget.value);
         if (value !== undefined) {
             settings[widget.name] = value;
@@ -403,6 +417,11 @@ function restoreSlot(found, saved, restore, problems, restored, label) {
     const targets = found.field ? [found.field.widget] : (targetNode.widgets || []).filter(isSetting);
     const put = (widget, value) => {
         const holder = found.field ? found.field : holderOf({ node: targetNode, widget });
+        if (holder.stuck) {
+            // Restoring it there would do nothing, since its own value isn't the one that's used.
+            problems.push(`${label}: ${stuckText(holder)}, so it couldn't be restored`);
+            return;
+        }
         setValue(holder.node, holder.widget, value, restored, label);
     };
 
@@ -759,8 +778,10 @@ function slotLabel(input) {
 }
 
 function captureProfile(node) {
+    // Also returns skipped: for each slot, the names of its settings that were left out (see captureNode).
     const slots = {};
     const problems = [];
+    const skipped = {};
     for (const input of node.inputs || []) {
         if (input.link == null) {
             continue;
@@ -770,9 +791,18 @@ function captureProfile(node) {
             problems.push(`${slotLabel(input)}: ${found.error}`);
             continue;
         }
-        slots[input.name] = found.field ? captureField(found.field) : captureNode(found.node);
+        if (found.field) {
+            slots[input.name] = captureField(found.field);
+            continue;
+        }
+        const left = [];
+        slots[input.name] = captureNode(found.node, left);
+        skipped[input.name] = left.map((item) => item.name);
+        for (const item of left) {
+            problems.push(`${slotLabel(input)}: ${item.text}, so it was left out`);
+        }
     }
-    return { slots, problems };
+    return { slots, problems, skipped };
 }
 
 async function saveInto(node, name) {
@@ -1152,7 +1182,7 @@ function saveWouldChange(node, name) {
     // True when clicking Save with this profile selected would change what's saved in it. Null when Save
     // wouldn't save anything, because nothing usable is connected.
     const savedSlots = profilesOf(node)[name]?.slots || {};
-    const { slots } = captureProfile(node);
+    const { slots, skipped } = captureProfile(node);
     const currentNames = Object.keys(slots);
     if (currentNames.length === 0) {
         return null;
@@ -1162,7 +1192,18 @@ function saveWouldChange(node, name) {
         return true;
     }
     const restore = restoreToggles(node);
-    return currentNames.some((slot) => comparable(slots[slot], restore) !== comparable(savedSlots[slot], restore));
+    // Settings left out because they can't be traced aren't compared either, even in profiles saved before.
+    const savedWithout = (slot) => {
+        const saved = savedSlots[slot];
+        const names = skipped[slot] || [];
+        if (!names.length || !saved?.settings) {
+            return saved;
+        }
+        const settings = { ...saved.settings };
+        names.forEach((item) => delete settings[item]);
+        return { ...saved, settings };
+    };
+    return currentNames.some((slot) => comparable(slots[slot], restore) !== comparable(savedWithout(slot), restore));
 }
 
 function differsFromProfile(node) {
