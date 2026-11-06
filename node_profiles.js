@@ -8,7 +8,8 @@ import { app } from "../../scripts/app.js";
 // muted, and its title, color, size and collapsed state. The toggles on the node decide which of those last
 // four are put back when a profile is loaded. A subgraph's own settings are never saved: a setting of a node
 // inside a subgraph that's shown as a field on the subgraph's outside is saved and restored through that
-// field, since that's where its value is kept.
+// field, since that's where its value is kept. A setting wired from another node is followed the same way, to
+// the setting on that node its value comes from, when there's exactly one (see valueSettingOf).
 //
 // Profiles are kept inside the node, so they're saved with the workflow.
 
@@ -134,7 +135,7 @@ function isReroute(node) {
 
 function sourceOf(graph, linkId) {
     // Follows a wire back to where its value comes from. Returns one of:
-    //   { node }: a node, whose settings are saved.
+    //   { node, slot }: a node, whose settings are saved, and the number of its output the wire starts at.
     //   { field: { node, widget } }: a single field on a subgraph's outside. This is when the wire starts at
     //       one of the subgraph's inputs inside it, and nothing is wired into that input outside.
     //   { error }
@@ -187,7 +188,7 @@ function sourceOf(graph, linkId) {
             linkId = insideLink;
             continue;
         }
-        return { node };
+        return { node, slot: link.origin_slot };
     }
     return { error: "its wire goes around in a loop" };
 }
@@ -196,6 +197,19 @@ function outerWidgetFor(outer, input) {
     // The field on a subgraph's outside that belongs to one of its inputs.
     const name = input.widget?.name ?? input.name;
     return (outer.widgets || []).find((widget) => widget.name === name) || null;
+}
+
+function valueSettingOf(node, slot) {
+    // The one setting of a node that the value of one of its outputs comes from: the setting with the same name
+    // as the output, like a node that passes "prompt_text" through, or else the node's only setting, like a
+    // String node. Otherwise null, since the value is worked out from more than one thing.
+    const settings = (node.widgets || []).filter(isSetting);
+    const name = node.outputs?.[slot]?.name;
+    const named = settings.find((widget) => widget.name === name);
+    if (named) {
+        return named;
+    }
+    return settings.length === 1 ? settings[0] : null;
 }
 
 function holderOf(target) {
@@ -209,9 +223,22 @@ function holderOf(target) {
             return target;
         }
         const link = findLink(node.graph, input.link);
-        if (!link || !startsAtSubgraphInput(link)) {
-            // Wired from another node, or not found: the setting's own value is used.
+        if (!link) {
             return target;
+        }
+        if (!startsAtSubgraphInput(link)) {
+            // Wired from another node: follow it to the setting there that the value comes from. If that can't
+            // be told, the setting's own value is used.
+            const found = sourceOf(node.graph, input.link);
+            if (found.field) {
+                return found.field;
+            }
+            const next = found.node ? valueSettingOf(found.node, found.slot) : null;
+            if (!next) {
+                return target;
+            }
+            target = { node: found.node, widget: next };
+            continue;
         }
         const outer = findSubgraphNode(node.graph);
         const outerInput = outer?.inputs?.[link.origin_slot];
