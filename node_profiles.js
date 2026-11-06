@@ -385,7 +385,8 @@ function setAndTell(node, widget, value, label) {
         // Lets the node react as if the value was picked by hand, such as Load Image showing the new image.
         widget.callback?.(widget.value, app.canvas, node);
     } catch (error) {
-        console.warn(`${LOG_PREFIX} ${label}: "${widget.name}" was restored, but the node had trouble updating:`, error);
+        // Only the kind of error, without names or values, since the browser console keeps it.
+        console.warn(`${LOG_PREFIX} A restored setting's node had trouble updating (${error?.name || "error"})`);
     }
 }
 
@@ -668,7 +669,7 @@ function warn(message) {
 }
 
 function done(message) {
-    console.log(`${LOG_PREFIX} ${message}`);
+    // Shown as a notice only, not written to the browser console, since it names the profile.
     const toast = app.extensionManager?.toast;
     if (typeof toast?.add === "function") {
         toast.add({ severity: "success", summary: NODE_TITLE, detail: message, life: 3000 });
@@ -689,7 +690,7 @@ function markChanged() {
             tracker.checkState();
         }
     } catch (error) {
-        console.warn(`${LOG_PREFIX} Couldn't record the change:`, error);
+        console.warn(`${LOG_PREFIX} Couldn't record the change (${error?.name || "error"})`);
     }
 }
 
@@ -735,7 +736,8 @@ function refreshProfileList(node, select) {
     if (!list.options.values.includes(list.value)) {
         list.value = list.options.values[0];
     }
-    // Selections made here, after Save As, Rename, Delete or Import, don't load anything.
+    // Selections made here don't load anything: after Save As and Rename, the selected profile already matches;
+    // after Delete and Import, the caller loads it (see loadNext).
     node._pickedProfile = list.value;
     node.setDirtyCanvas?.(true, true);
 }
@@ -775,6 +777,34 @@ function selectedProfile(node) {
 
 function slotLabel(input) {
     return input.label || input.name;
+}
+
+function newOptions(node, name) {
+    // Lines naming the settings the connected nodes have that the profile wasn't saved with, one line per slot,
+    // and the connected slots the profile has nothing saved for.
+    const savedSlots = profilesOf(node)[name]?.slots || {};
+    const { slots } = captureProfile(node);
+    const lines = [];
+    for (const input of node.inputs || []) {
+        const current = slots[input.name];
+        if (!current) {
+            continue;
+        }
+        const found = sourceOf(node.graph, input.link);
+        const title = (found.field ? found.field.node : found.node)?.title;
+        const label = title ? `${slotLabel(input)} (${title})` : slotLabel(input);
+        const saved = savedSlots[input.name];
+        if (!saved) {
+            lines.push(`- ${label}: nothing saved for it yet`);
+            continue;
+        }
+        const savedSettings = saved.settings || {};
+        const missing = Object.keys(current.settings || {}).filter((setting) => !(setting in savedSettings));
+        if (missing.length > 0) {
+            lines.push(`- ${label}: ${missing.join(", ")}`);
+        }
+    }
+    return lines;
 }
 
 function captureProfile(node) {
@@ -895,12 +925,21 @@ async function loadProfile(node) {
     }
     checkForChanges(node);
     markChanged();
+    // Settings the nodes have now that this profile was saved without, like a setting added by an update. Loading
+    // leaves them as they are, so Save stays green until the profile is saved with them, even after Discard.
+    const additions = newOptions(node, name);
+    const parts = [];
     if (problems.length > 0) {
-        await warn(`Loaded "${name}", with these problems:\n\n${problems.join("\n")}`);
-    } else {
-        // No notice: profiles load every time one is picked, so notices would pile up while flipping through.
-        console.log(`${LOG_PREFIX} Loaded "${name}"`);
+        parts.push(`Loaded "${name}", with these problems:\n\n${problems.join("\n")}`);
     }
+    if (additions.length > 0) {
+        parts.push(`The node has additional options that can be saved to this profile:\n\n${additions.join("\n")}`);
+    }
+    if (parts.length > 0) {
+        await warn(parts.join("\n\n"));
+    }
+    // No notice when it loaded cleanly: profiles load every time one is picked, so notices would pile up while
+    // flipping through.
 }
 
 async function saveProfile(node) {
@@ -956,6 +995,30 @@ async function renameProfile(node) {
     done(`Renamed "${oldName}" to "${newName}"`);
 }
 
+function savedInAnyProfile(node) {
+    // Whether the current settings are exactly what one of the profiles holds, so loading another wouldn't lose
+    // them. Also true when nothing usable is connected, since there's nothing to lose.
+    const names = profileNames(node);
+    return names.some((name) => saveWouldChange(node, name) !== true);
+}
+
+async function loadNext(node, name) {
+    // After Delete or Import, the newly selected profile is loaded, like picking it from the list. If the current
+    // settings aren't saved in any of the profiles left, loading would lose them, so it asks first; answering no
+    // keeps the profile selected without loading anything.
+    if (!name || name === NO_PROFILE || !hasProfile(profilesOf(node), name)) {
+        return;
+    }
+    if (!node._loading && !savedInAnyProfile(node)) {
+        const message = `The current settings aren't saved in any profile now. Load "${name}" anyway?`;
+        if (!(await confirmDialog(message, "default"))) {
+            checkForChanges(node);
+            return;
+        }
+    }
+    await loadProfile(node);
+}
+
 async function deleteProfile(node) {
     const name = selectedProfile(node);
     if (!name) {
@@ -965,9 +1028,11 @@ async function deleteProfile(node) {
         return;
     }
     delete profilesOf(node)[name];
-    refreshProfileList(node, profileNames(node)[0] ?? NO_PROFILE);
+    const next = profileNames(node)[0] ?? NO_PROFILE;
+    refreshProfileList(node, next);
     markChanged();
     done(`Deleted "${name}"`);
+    await loadNext(node, next);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1086,9 +1151,11 @@ async function importProfiles(node) {
         return;
     }
     node.properties.profiles = replacement;
-    refreshProfileList(node, profileNames(node)[0] ?? NO_PROFILE);
+    const next = profileNames(node)[0] ?? NO_PROFILE;
+    refreshProfileList(node, next);
     markChanged();
     done(`Imported ${newCount} profile(s) from ${file.name}`);
+    await loadNext(node, next);
 }
 
 // ---------------------------------------------------------------------------------------------------------

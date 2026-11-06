@@ -16,11 +16,12 @@ Profiles are kept inside the node, so they're saved with the workflow. Save the 
 
 - **profile:** the list of saved profiles. Picking a different one loads it. If the current profile has changes that haven't been saved, it asks first.
 - **Save:** saves the current settings over the selected profile, after asking. It turns green when the loaded profile has changes that could be saved.
+- **New options:** if the connected nodes have settings the profile was saved without, like a setting added by an update, loading the profile or clicking **Discard** shows a message listing them. They're left as they are, and Save stays green until you save the profile with them.
 - **Discard:** discards your changes by putting the selected profile's saved settings back. It's grayed out while there are no changes to discard. If a slot has saved settings but nothing connected, or a saved value no longer exists, the rest is still restored and a message lists what was skipped. Each saved setting goes back to the setting with the same name. Saved text that has no matching name, such as when a node was swapped for a different kind, goes into the remaining text fields in order, first to first. A message only appears for saved settings that had nowhere to go.
 - **Save As:** saves the current settings under a new name. Using an existing name asks before overwriting.
 - **Rename:** renames the selected profile. A name that's already in use is refused.
-- **Delete:** deletes the selected profile, after asking.
+- **Delete:** deletes the selected profile, after asking, then loads the first remaining profile. If the current settings aren't saved in any remaining profile, loading would lose them, so it asks first; answering no selects that profile without loading it.
 - **fast load:** on by default, so profiles load at once. Turn it off if a node doesn't fully load correctly, such as a node that changes its own settings or loads its choices a moment late. Then, after a profile is picked, a blue bar fills the profile list while Node Profiles takes about a second to check that every setting stuck, putting back any the node changed.
 - **restore title, restore color, restore size, restore collapsed:** these are always saved, but only put back when turned on. All are off by default.
-- **Import:** replaces all the node's profiles with the ones from an exported .nodeprofiles file, after asking.
+- **Import:** replaces all the node's profiles with the ones from an exported .nodeprofiles file, after asking, then loads the first of them. If the current settings aren't saved in any of the imported profiles, it asks first; answering no selects that profile without loading it.
 - **Export:** saves all the node's profiles to a .nodeprofiles file. It's ordinary text, but doesn't end in .json, so it isn't mistaken for a workflow.
